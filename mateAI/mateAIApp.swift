@@ -22,6 +22,10 @@ struct mateAIApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .task {
+                    LLMService.shared.refreshAvailability()
+                    try? await MLXLlamaProvider.loadIfNeeded()
+                }
         }
         .modelContainer(sharedModelContainer)
     }

@@ -49,18 +49,33 @@ struct OnboardingView: View {
     }
 
     private func saveProfile() {
-        let profile = UserProfile(
-            name: name,
-            occupation: occupation,
-            typicalWorkHours: workHours,
-            stressors: stressors,
-            sleepHours: sleepHours,
-            exerciseFrequency: exerciseFrequency,
-            supportSystem: supportSystem,
-            goals: goals,
-            hasCompletedOnboarding: true
-        )
-        context.insert(profile)
+        let descriptor = FetchDescriptor<UserProfile>()
+        let existing = (try? context.fetch(descriptor))?.first
+
+        if let existing {
+            existing.name = name
+            existing.occupation = occupation
+            existing.typicalWorkHours = workHours
+            existing.stressors = stressors
+            existing.sleepHours = sleepHours
+            existing.exerciseFrequency = exerciseFrequency
+            existing.supportSystem = supportSystem
+            existing.goals = goals
+            existing.hasCompletedOnboarding = true
+        } else {
+            let profile = UserProfile(
+                name: name,
+                occupation: occupation,
+                typicalWorkHours: workHours,
+                stressors: stressors,
+                sleepHours: sleepHours,
+                exerciseFrequency: exerciseFrequency,
+                supportSystem: supportSystem,
+                goals: goals,
+                hasCompletedOnboarding: true
+            )
+            context.insert(profile)
+        }
         try? context.save()
     }
 }

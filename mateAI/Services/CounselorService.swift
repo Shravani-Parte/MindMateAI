@@ -1,51 +1,105 @@
 import Foundation
 
-/// Generates empathetic, non-diagnostic supportive replies.
+/// Generates empathetic, non-diagnostic supportive replies using on-device LLM when available.
 ///
-/// NOTE: To keep this mini-project runnable on any device with zero setup,
-/// this is a lightweight local template engine driven by sentiment band +
-/// profile context — NOT a generative model.
-///
-/// To upgrade to a real on-device LLM, replace the body of `reply(to:...)`
-/// with a call to one of:
-///   - Apple Foundation Models: `LanguageModelSession` (iOS 18+, A17 Pro/M-series+)
-///   - MLX-Swift or llama.cpp with a quantized small model (e.g. Llama-3-8B-4bit)
-/// Keep the same function signature so ChatViewModel doesn't need to change.
+/// Pipeline: Ollama (local Gemma, if enabled & reachable) → Foundation Models (Apple
+/// Intelligence) → optional MLX Llama → template fallback.
+/// `RiskDetector` runs before this service is called; `ResponseGuardrail` filters LLM output.
+@MainActor
 final class CounselorService {
     static let shared = CounselorService()
 
-    private let repliesByBand: [String: [String]] = [
-        "Very Low": [
-            "That sounds really heavy. I'm here with you — would it help to talk through what's weighing on you?",
-            "I can hear that today has been hard. You don't have to carry this alone."
-        ],
-        "Low": [
-            "It sounds like today has been tough. What's one small thing that might make the next hour a bit easier?",
-            "Thanks for sharing that. Rough days happen — want to try a short grounding exercise together?"
-        ],
-        "Neutral": [
-            "Thanks for checking in. How has your energy been today compared to usual?",
-            "I'm listening. Is there anything specific on your mind right now?"
-        ],
-        "High": [
-            "Glad to hear some positive energy today. What's been going well?",
-            "That's great to hear. What helped make today feel this way?"
-        ],
-        "Very High": [
-            "Love hearing that! What's one thing you'd like to carry forward from today?",
-            "That's wonderful. Want to jot down what's working so you can look back on it later?"
-        ]
-    ]
+    /// Which backend actually produced the most recent reply — kept for the chat status
+    /// bar and Settings screen, since Ollama's availability can change reply to reply.
+    private(set) var lastUsedBackend: LLMBackend = .template
 
-    func reply(to message: String, sentimentScore: Double, profile: UserProfile?) -> String {
-        let band = Constants.band(for: sentimentScore)
-        let options = repliesByBand[band] ?? repliesByBand["Neutral"]!
-        var response = options.randomElement() ?? options[0]
+    /// Streams a reply fragment-by-fragment. Tries Ollama first (when enabled), then
+    /// Apple's on-device model, then MLX Llama, then the template fallback. Always yields
+    /// at least one fragment unless the consuming task is cancelled, so the chat never
+    /// hangs on an empty reply.
+    func streamChatReply(
+        history: [OllamaProvider.ChatMessagePayload],
+        sentimentScore: Double,
+        profile: UserProfile?
+    ) -> AsyncThrowingStream<String, Error> {
+        let latestUserText = history.last?.content ?? ""
 
-        if let profile, !profile.stressors.trimmingCharacters(in: .whitespaces).isEmpty,
-           band == "Low" || band == "Very Low" {
-            response += " I remember you mentioned \(profile.stressors.lowercased()) has been a stressor lately — is that part of it?"
+        return AsyncThrowingStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
+
+                // 1) Local Ollama (Gemma) — streaming.
+                if OllamaSettings.shared.isEnabled {
+                    var receivedContent = false
+                    do {
+                        let stream = OllamaProvider.streamChat(
+                            history: history,
+                            sentimentScore: sentimentScore,
+                            profile: profile
+                        )
+                        for try await fragment in stream {
+                            receivedContent = true
+                            continuation.yield(fragment)
+                        }
+                    } catch {
+                        // Partial content is already delivered; fall through only if empty.
+                    }
+                    if receivedContent {
+                        self.lastUsedBackend = .ollama
+                        continuation.finish()
+                        return
+                    }
+                }
+
+                // 2) Apple on-device LLM.
+                if let appleReply = await LLMService.shared.generateReply(
+                    userMessage: latestUserText,
+                    sentimentScore: sentimentScore,
+                    profile: profile
+                ) {
+                    self.lastUsedBackend = LLMService.shared.activeBackend
+                    continuation.yield(ResponseGuardrail.filter(appleReply))
+                    continuation.finish()
+                    return
+                }
+
+                // 3) Optional bundled Llama (MLX).
+                if MLXLlamaProvider.isAvailable,
+                   let llamaReply = await MLXLlamaProvider.generate(
+                       userMessage: latestUserText,
+                       sentimentScore: sentimentScore,
+                       profile: profile
+                   ) {
+                    self.lastUsedBackend = .mlxLlama
+                    continuation.yield(ResponseGuardrail.filter(llamaReply))
+                    continuation.finish()
+                    return
+                }
+
+                // 4) Supportive templates.
+                self.lastUsedBackend = .template
+                continuation.yield(
+                    TemplateLLMProvider.shared.reply(
+                        to: latestUserText,
+                        sentimentScore: sentimentScore,
+                        profile: profile
+                    )
+                )
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-        return response
+    }
+
+    /// Synchronous template-only path (used by previews and tests).
+    func reply(to message: String, sentimentScore: Double, profile: UserProfile?) -> String {
+        TemplateLLMProvider.shared.reply(
+            to: message,
+            sentimentScore: sentimentScore,
+            profile: profile
+        )
     }
 }
